@@ -220,23 +220,6 @@ static void print_stats(stats_t *s) {
 stats_t stats;
 #endif //ENABLE_STATISTICS
 
-
-//Simple write utility function
-/*static int write_file(int fd, u_char type, u_long len, u_char * content) {
-  if (xwrite(fd, &type, sizeof(type)) < 0){
-    perror("xwrite:");
-    EXIT_TRACE("xwrite type fails\n");
-    return -1;
-  }
-  if (xwrite(fd, &len, sizeof(len)) < 0){
-    EXIT_TRACE("xwrite content fails\n");
-  }
-  if (xwrite(fd, content, len) < 0){
-    EXIT_TRACE("xwrite content fails\n");
-  }
-  return 0;
-}*/
-
 /*
  * Helper function that creates and initializes the output file
  * Takes the file name to use as input and returns the file handle
@@ -258,36 +241,6 @@ static int create_output_file(char *outfile) {
   return fd;
 }
 
-/*
- * Helper function that writes a chunk to an output file depending on
- * its state. The function will write the SHA1 sum if the chunk has
- * already been written before, or it will write the compressed data
- * of the chunk if it has not been written yet.
- *
- * This function will block if the compressed data is not available yet.
- * This function might update the state of the chunk if there are any changes.
- */
-//NOTE: The serial version relies on the fact that chunks are processed in-order,
-//      which means if it reaches the function it is guaranteed all data is ready.
-/*static void write_chunk_to_file(int fd, chunk_t *chunk) {
-  assert(chunk!=NULL);
-
-  if(!chunk->header.isDuplicate) {
-    //Unique chunk, data has not been written yet, do so now
-    //printf("Unieke chunk\n");
-    write_file(fd, TYPE_COMPRESS, chunk->compressed_data.n, chunk->compressed_data.ptr);
-    //printf("Chunk is geschreven\n");
-    mbuffer_free(&chunk->compressed_data);
-    //printf("Buffer is vrij\n");
-  } else {
-    //printf("Dubbele chunk\n");
-    //Duplicate chunk, data has been written to file before, just write SHA1
-    write_file(fd, TYPE_FINGERPRINT, SHA1_LEN, (unsigned char *)(chunk->sha1));
-    //printf("Dubbele chunk is gechreven\n");
-  }
-}*/
-//#endif //ENABLE_PTHREADS
-
 int rf_win;
 int rf_win_dataprocess;
 
@@ -296,57 +249,25 @@ int rf_win_dataprocess;
  * Actions performed: Compress a data chunk
  */
 void sub_Compress(chunk_t *chunk) {
-    //size_t n;
     int r;
-
-    //if(chunk->header.isDuplicate) return;
 
     assert(chunk!=NULL);
     switch (conf->compress_type) {
       case COMPRESS_NONE:
-        //printf("No compression\n");
-        //Simply duplicate the data
-        //r = mbuffer_create(&chunk->compressed_data, n);
-        /*if(r != 0) {
-          EXIT_TRACE("Creation of compression buffer failed.\n");
-        }*/
         //copy the block
         chunk->compressed_data.n = chunk->uncompressed_data.n;
         memcpy(chunk->compressed_data.ptr, chunk->uncompressed_data.ptr, chunk->uncompressed_data.n);
         break;
 #ifdef ENABLE_GZIP_COMPRESSION
       case COMPRESS_GZIP:
-        //printf("GZIP compression\n");
-        //Gzip compression buffer must be at least 0.1% larger than source buffer plus 12 bytes
-        //n = chunk->uncompressed_data.n + (chunk->uncompressed_data.n >> 9) + 12;
-        //r = mbuffer_create(&chunk->compressed_data, n);
-        /*if(r != 0) {
-          EXIT_TRACE("Creation of compression buffer failed.\n");
-        }*/
-        //compress the block
-        //printf("Voor compress functie\n");
-        /*printf("Compressed data ptr = %p\n", chunk->compressed_data.ptr);
-        printf("Compressed data n = %d\n", chunk->compressed_data.n);
-        printf("Uncompressed data ptr = %p\n", chunk->uncompressed_data.ptr);
-        printf("Uncompressed data n = %d\n", chunk->uncompressed_data.n);*/
-
         r = compress(chunk->compressed_data.ptr, &chunk->compressed_data.n, chunk->uncompressed_data.ptr, chunk->uncompressed_data.n);
-        //printf("Na compress functie\n");
-        //memcpy(chunk->compressed_data.ptr, chunk->uncompressed_data.ptr, chunk->uncompressed_data.n);
-        //chunk->compressed_data.n = chunk->uncompressed_data.n;
         if (r != Z_OK) {
           EXIT_TRACE("Compression failed. Error code: %d\n",r);
         }
-        //Shrink buffer to actual size
-        /*if(n < chunk->compressed_data.n) {
-          r = mbuffer_realloc(&chunk->compressed_data, n);
-          assert(r == 0);
-        }*/
         break;
 #endif //ENABLE_GZIP_COMPRESSION
 #ifdef ENABLE_BZIP2_COMPRESSION
       case COMPRESS_BZIP2:
-        //printf("BZIP2 compression");
         //Bzip compression buffer must be at least 1% larger than source buffer plus 600 bytes
         n = chunk->uncompressed_data.n + (chunk->uncompressed_data.n >> 6) + 600;
         r = mbuffer_create(&chunk->compressed_data, n);
@@ -371,9 +292,7 @@ void sub_Compress(chunk_t *chunk) {
         EXIT_TRACE("Compression type not implemented.\n");
         break;
     }
-    //printf("Voor mbuffer_free\n");
     mbuffer_free(&chunk->uncompressed_data);
-    //printf("Na mbuffer_free\n");
 
 #ifdef ENABLE_PTHREADS
     chunk->header.state = CHUNK_STATE_COMPRESSED;
@@ -396,164 +315,84 @@ void Compress(void * targs) {
   List * list = args->list;
 
   #ifdef ENABLE_STATISTICS
-  /*stats_t *thread_stats = malloc(sizeof(stats_t));
-  if(thread_stats == NULL) EXIT_TRACE("Memory allocation failed.\n");*/
   stats_t * thread_stats = args->stats;
   init_stats(thread_stats);
   #endif //ENABLE_STATISTICS
 
-//printf("In compress\n");
+  //Allocate memory for compressed data buffers
 
-//Allocate memory for compressed data buffers
+  int total_chunks = 0;
+  int duplicate_chunks = 0;
+  size_t total_size = 0;
+  void * mbuffers;
+  chunk_t * chunk_refs[1000];
 
-int total_chunks = 0;
-int duplicate_chunks = 0;
-size_t total_size = 0;
-void * mbuffers;
-//size_t total_compressed_size = 0;
-chunk_t * chunk_refs[1000];
+  int write_buffers_index = 0;
 
-int write_buffers_index = 0;
+  Iterator * iter = init_iterator(list);
+  while(hasNext(iter)){
+    chunk_t * c = next(iter);
+    chunk_refs[total_chunks] = c;
+    total_chunks++;
 
-//int total = 0;
-
-
-Iterator * iter = init_iterator(list);
-
-  //printf("Lengte lijst: %d\n",list->length);
-
-
-while(hasNext(iter)){
-  //printf("Blijkbaar is er nog een element..\n");
-  //Take next chunk
-  chunk_t * c = next(iter);
-  //printf("L1: %d, L2: %d\n",c->sequence.l1num, c->sequence.l2num);
-
-  chunk_refs[total_chunks] = c;
-  total_chunks++;
-  //printf("Total chunks: %d\n", total_chunks);
-
-
-
-  // If chunk is unique, update counter to reserve memory for compressed buffer.
-  if(c->header.isDuplicate) duplicate_chunks++;
-  else{
-    thread_stats->total_dedup += c->uncompressed_data.n;
-    size_t * size = &c->compressed_data.n;
-    //if (&c->uncompressed_data == NULL) printf("Dikke zever\n");
-    if(conf->compress_type == COMPRESS_NONE) *size =  c->uncompressed_data.n;
-    else *size = c->uncompressed_data.n + (c->uncompressed_data.n >> 9) + 12;
-    //printf("Size compressed data = %d\n", *size);
-    total_size += *size;
-  }
-
-
-  //If we found 1000 chunks or found the last chunk, process the batch.
-  if(total_chunks == 1000 || !hasNext(iter)){
-    int index = 0;
-    //printf("Total size: %d\n", total_size);
-    mbuffers = malloc(total_size);
-    total_size = 0;
-    //printf("Total chunks: %d\n",total_chunks);
-    //total = 0;
-    for(int i = 0; i<total_chunks; i++){
-
-      //printf("In compressie\n");
-      chunk_t * chunk = chunk_refs[i];
-      if(!chunk->header.isDuplicate){
-        chunk->compressed_data.ptr = mbuffers + index;
-        index += chunk->compressed_data.n;
-
-
-        /*char * ptr = &mbuffers[index] + sizeof(mcb_t);
-        mbuffer_t * m = &(chunk->compressed_data);
-        m->mcb = (mcb_t*) (&mbuffers[index]);
-        m->ptr = ptr;
-        m->mcb->i = 1;
-        m->mcb->ptr = ptr;
-        #ifdef ENABLE_MBUFFER_CHECK
-          m->check_flag = MBUFFER_CHECK_MAGIC;
-        #endif
-        index += sizeof(mcb_t) + m->n;*/
-        //printf("Compressed data vlak voor sub_compress: %d\n",m->n);
-
-        //printf("Pointer naar mbuffer compressed data: %p\n",ptr);
-        //printf("Unique chunks = %d, total = %d\n",unique_chunks,total);
-        //printf("Voor sub_compress\n");
-        //printf("Waarde i: %d\n",i);
-        //printf("Totale waarde vrijgemaakt voor compressed data: %d, waarde ingenomen: %d, grootte volgende: %d\n", total_malloced, index, m->n);
-        sub_Compress(chunk);
-        //printf("Achter sub_compress\n");
-        thread_stats->total_compressed += chunk->compressed_data.n;
-        total_size += chunk->compressed_data.n;
-      }
-      //printf("Aan einde compressie\n");
-      //mbuffer_free(&chunk->uncompressed_data);
+    // If chunk is unique, update counter to reserve memory for compressed buffer.
+    if(c->header.isDuplicate) duplicate_chunks++;
+    else{
+      thread_stats->total_dedup += c->uncompressed_data.n;
+      size_t * size = &c->compressed_data.n;
+      if(conf->compress_type == COMPRESS_NONE) *size =  c->uncompressed_data.n;
+      else *size = c->uncompressed_data.n + (c->uncompressed_data.n >> 9) + 12;
+      total_size += *size;
     }
-    //printf("Voorbij compressie\n");
-    int write_buffer_size = duplicate_chunks * SHA1_LEN + total_chunks * 9 + total_size;
-    char * write_buffer = malloc(write_buffer_size);
 
-    index = 0;
-    for(int i = 0; i < total_chunks; i++){
-      //printf("In schrijven\n");
-      chunk_t * chunk = chunk_refs[i];
-      if (chunk->header.isDuplicate){
-        thread_stats->nDuplicates++;
-        write_buffer[index] = 0;
-        *((u_long*) (&write_buffer[index+1])) = SHA1_LEN;
-        index += 9;
-        memcpy(write_buffer + index, &chunk->sha1, SHA1_LEN);
-        index += SHA1_LEN;
-        //mbuffer_free(&chunk->uncompressed_data);
-        //free(chunk);
+    //If we found 1000 chunks or found the last chunk, process the batch.
+    if(total_chunks == 1000 || !hasNext(iter)){
+      int index = 0;
+      mbuffers = malloc(total_size);
+      total_size = 0;
+      for(int i = 0; i<total_chunks; i++){
+        chunk_t * chunk = chunk_refs[i];
+        if(!chunk->header.isDuplicate){
+          chunk->compressed_data.ptr = mbuffers + index;
+          index += chunk->compressed_data.n;
+          sub_Compress(chunk);
+          thread_stats->total_compressed += chunk->compressed_data.n;
+          total_size += chunk->compressed_data.n;
+        }
       }
-      else{
-        write_buffer[index] = 1;
-        *((u_long*) (&write_buffer[index+1])) = chunk->compressed_data.n;
-        index += 9;
-        memcpy(write_buffer + index, chunk->compressed_data.ptr, chunk->compressed_data.n);
-        //if(chunk->compressed_data.n>100000) printf("Chunk van meer dan 100 kB\n");
-        index += chunk->compressed_data.n;
-        //mbuffer_free(&chunk->compressd_data);
-        //free(chunk);
+
+      int write_buffer_size = duplicate_chunks * SHA1_LEN + total_chunks * 9 + total_size;
+      char * write_buffer = malloc(write_buffer_size);
+
+      index = 0;
+      for(int i = 0; i < total_chunks; i++){
+        chunk_t * chunk = chunk_refs[i];
+        if (chunk->header.isDuplicate){
+          thread_stats->nDuplicates++;
+          write_buffer[index] = 0;
+          *((u_long*) (&write_buffer[index+1])) = SHA1_LEN;
+          index += 9;
+          memcpy(write_buffer + index, &chunk->sha1, SHA1_LEN);
+          index += SHA1_LEN;
+        }
+        else{
+          write_buffer[index] = 1;
+          *((u_long*) (&write_buffer[index+1])) = chunk->compressed_data.n;
+          index += 9;
+          memcpy(write_buffer + index, chunk->compressed_data.ptr, chunk->compressed_data.n);
+          index += chunk->compressed_data.n;
+        }
       }
-      //free(chunk);
+      args->compressed_data[write_buffers_index].data = write_buffer;
+      args->compressed_data[write_buffers_index].size = write_buffer_size;
+      write_buffers_index++;
+      total_chunks = 0;
+      duplicate_chunks = 0;
     }
-    //free(mbuffers);
-    //write_buffers[write_buffers_index] = write_buffer;
-    args->compressed_data[write_buffers_index].data = write_buffer;
-    args->compressed_data[write_buffers_index].size = write_buffer_size;
-    write_buffers_index++;
-    total_chunks = 0;
-    duplicate_chunks = 0;
-    //printf("Voorbij schrijven\n");
-
-
   }
-
-   //total++;
-   //printf("Processed a total of %d chunks\n",total);
-}
-  //printf("Voorbij loop\n");
   destroy_iterator(iter);
-  //printf("Iterator kaput\n");
-  //destroy_soft(list);
-  //destroy(list);
-  //printf("List kaput\n");
   free(list);
-
-  //printf("Uit compress\n");
-
-
-  /*#ifdef ENABLE_STATISTICS
-    return thread_stats;
-  #else
-    return NULL;
-  #endif //ENABLE_STATISTICS*/
-
 }
-//#endif //ENABLE_PTHREADS
 
  /* Computational kernel of deduplication stage
  *
@@ -588,7 +427,6 @@ int sub_Deduplicate(chunk_t *chunk) {
       chunk->header.isDuplicate = 0;
       entry->compressed_data_ref = chunk;
       mbuffer_free(&entry->uncompressed_data);
-      //free(&entry->uncompressed_data);
       if (hashtable_insert(cache, (void *)(chunk->sha1), (void *)chunk) == 0) {
         EXIT_TRACE("hashtable_insert failed");
       }
@@ -599,7 +437,6 @@ int sub_Deduplicate(chunk_t *chunk) {
       entry->header.isDuplicate = 0;
       chunk->compressed_data_ref = entry;
       mbuffer_free(&chunk->uncompressed_data);
-      //free(&chunk->uncompressed_data);
     }
   }
   else{
@@ -635,47 +472,18 @@ void Deduplicate(void * targs) {
   Node * buffer = list->head;
 
   #ifdef ENABLE_STATISTICS
-    /*stats_t *thread_stats = malloc(sizeof(stats_t));
-    if(thread_stats == NULL) {
-      EXIT_TRACE("Memory allocation failed.\n");
-    }
-    */
     stats_t* thread_stats = args->stats;
     init_stats(thread_stats);
   #endif //ENABLE_STATISTICS
 
-  //Iterator * iter = init_iterator(list);
   int len = list->length;
   for(int i = 0; i< len; i++) {
-    //chunk = next(iter);
     node = buffer;
     buffer = buffer->next;
-    //if(node->data == NULL) printf("Data is null, i = %d\n",i);
-
     assert(node->data!=NULL);
-
     //Do the processing
     sub_Deduplicate(node->data);
-
-/*#ifdef ENABLE_STATISTICS
-    if(isDuplicate) {
-      thread_stats->nDuplicates++;
-    } else {
-      thread_stats->total_dedup += node->data->uncompressed_data.n;
-    }
-#endif //ENABLE_STATISTICS*/
-    //Enqueue chunk either into compression queue or into send queue
-    //if(isDuplicate) thread_stats->nDuplicates++;
-    //list_index++;
   }
-  //destroy_soft(list);
-  //destroy_iterator(iter);
-
-/*#ifdef ENABLE_STATISTICS
-  return thread_stats;
-#else
-  return NULL;
-#endif //ENABLE_STATISTICS*/
 }
 #endif //ENABLE_PTHREADS
 
@@ -689,7 +497,6 @@ void Deduplicate(void * targs) {
  * Notes:
  *  - Allocates mbuffers for fine-granular chunks*/
 void FragmentRefine(void * targs) {
-  //printf("In fragmentRefine\n");
   struct thread_args *args = (struct thread_args *)targs;
   int r;
   List * list = (List *)args->list;
@@ -701,12 +508,6 @@ void FragmentRefine(void * targs) {
   if(rabintab == NULL || rabinwintab == NULL) EXIT_TRACE("Memory allocation failed.\n");
 
 #ifdef ENABLE_STATISTICS
-  /*stats_t *thread_stats = malloc(sizeof(stats_t));
-  if(thread_stats == NULL) {
-    EXIT_TRACE("Memory allocation failed.\n");
-  }
-  */
-
   stats_t *thread_stats = args->stats;
   init_stats(thread_stats);
 #endif //ENABLE_STATISTICS
@@ -715,18 +516,12 @@ void FragmentRefine(void * targs) {
   List * refined = emptylist();
   Iterator * iter = init_iterator(list);
   while (hasNext(iter)) {
-    //printf("Aan begin loop\n");
-    //printf("Voor keuze nieuwe chunk\n");
     chunk = next(iter);
-    //printf("Nieuwe chunk = %p\n", chunk);
     assert(chunk!=NULL);
-
     rabininit(rf_win, rabintab, rabinwintab);
-
     int split;
     chcount = 0;
     do {
-      //printf("Aan begin loop\n");
       //Find next anchor with Rabin fingerprint
       int offset = rabinseg(chunk->uncompressed_data.ptr, chunk->uncompressed_data.n, rf_win, rabintab, rabinwintab);
       //Can we split the buffer?
@@ -772,27 +567,13 @@ void FragmentRefine(void * targs) {
         chunk = NULL;
         split = 0;
       }
-      //printf("Aan einde loop\n");
     } while(split);
-    //printf("Aan einde loop\n");
   }
-  //printf("Voorbij loop\n");
-  //printf("Lengte refined: %d\n", refined->length);
-  *(args->list_addr) = refined;
-  //printf("Lijst adressen aangepast\n");
-  //destroy_soft(list);
-  //printf("Lijst vrijgegeven\n");
 
+  *(args->list_addr) = refined;
   free(rabintab);
   free(rabinwintab);
   destroy_iterator(iter);
-/*
-#ifdef ENABLE_STATISTICS
-  return thread_stats;
-#else
-  return NULL;
-#endif //ENABLE_STATISTICS
-//printf("Uit fragmentRefine\n");*/
 }
 
 /*
@@ -814,7 +595,6 @@ void FragmentRefine(void * targs) {
  */
 #ifdef ENABLE_PTHREADS
 List * Fragment(void * targs){
-  //printf("In fragment\n");
   struct thread_args *args = (struct thread_args *)targs;
   size_t preloading_buffer_seek = 0;
   int fd = args->fd;
@@ -842,18 +622,14 @@ List * Fragment(void * targs){
 
   //read from input file / buffer
   while (1) {
-    //printf("Aan het begin loop\n");
     size_t bytes_left; //amount of data left over in last_mbuffer from previous iteration
 
     //Check how much data left over from previous iteration resp. create an initial chunk
-    //printf("Voor nakijken temp\n");
     if(temp != NULL) {
       bytes_left = temp->uncompressed_data.n;
     } else {
       bytes_left = 0;
     }
-    //printf("Na nakijken temp\n");
-
     //Make sure that system supports new buffer size
     if(MAXBUF+bytes_left > SSIZE_MAX) {
       EXIT_TRACE("Input buffer size exceeds system maximum.\n");
@@ -864,43 +640,28 @@ List * Fragment(void * targs){
     mbuffer_create(&chunk->uncompressed_data, MAXBUF+bytes_left);
 
     if(bytes_left > 0) {
-      //printf("In bytes left > 0\n");
-      //printf("Chunk = %p\n",chunk);
-      //printf("Bytes lef")
-      //FIXME: Short-circuit this if no more data available
-
       //"Extension" of existing buffer, copy sequence number and left over data to beginning of new buffer
       chunk->header.state = CHUNK_STATE_UNCOMPRESSED;
       chunk->sequence.l1num = temp->sequence.l1num;
-
-      //printf("Voor memcpy\n");
       //NOTE: We cannot safely extend the current memory region because it has already been given to another thread
       memcpy(chunk->uncompressed_data.ptr, temp->uncompressed_data.ptr, temp->uncompressed_data.n);
       mbuffer_free(&temp->uncompressed_data);
-      //printf("Achter mbuffer_free\n");
-      //printf("Temp: %p\n",temp);
       free(temp);
-      //printf("Freed temp\n");
       temp = NULL;
-      //printf("Uit bytes left > 0\n");
     } else {
       //brand new mbuffer, increment sequence number
       chunk->header.state = CHUNK_STATE_UNCOMPRESSED;
       chunk->sequence.l1num = anchorcount;
       anchorcount++;
     }
-    //printf("Voor inlezen\n");
     //Read data until buffer full
     size_t bytes_read=0;
     if(conf->preloading) {
-      //printf("Aan het inlezen\n");
       size_t max_read = MIN(MAXBUF, args->input_file.size-preloading_buffer_seek);
       memcpy(chunk->uncompressed_data.ptr+bytes_left, args->input_file.buffer+preloading_buffer_seek, max_read);
       bytes_read = max_read;
       preloading_buffer_seek += max_read;
-      //printf("Uit inlezen\n");
     } else {
-      //printf("Aan het inlezen\n");
       while(bytes_read < MAXBUF) {
         int r = read(fd, chunk->uncompressed_data.ptr+bytes_left+bytes_read, MAXBUF-bytes_read);
         if(r<0) switch(errno) {
@@ -924,7 +685,6 @@ List * Fragment(void * targs){
         if(r==0) break;
         bytes_read += r;
       }
-      //printf("Uit inlezen\n");
     }
     //No data left over from last iteration and also nothing new read in, simply clean up and quit
     if(bytes_left + bytes_read == 0) {
@@ -933,7 +693,6 @@ List * Fragment(void * targs){
           m->check_flag=0;
       #endif
       free(chunk);
-      //printf("Freed chunk: %p\n",chunk);
       chunk = NULL;
       break;
     }
@@ -944,16 +703,13 @@ List * Fragment(void * targs){
     }
     //Check whether any new data was read in, enqueue last chunk if not
     if(bytes_read == 0) {
-      //printf("Voor add\n");
       add(chunk, list);
-      //printf("Achter add\n");
       //NOTE: No need to empty a full send_buf, we will break now and pass everything on to the queue
       break;
     }
     //partition input block into large, coarse-granular chunks
     int split;
     do {
-      //printf("Aan het begin split loop\n");
       split = 0;
       //Try to split the buffer at least ANCHOR_JUMP bytes away from its beginning
       if(ANCHOR_JUMP < chunk->uncompressed_data.n) {
@@ -975,8 +731,6 @@ List * Fragment(void * targs){
           memcpy(temp->uncompressed_data.ptr, chunk->uncompressed_data.ptr ,size);
 
           //split it into two pieces
-          //r = mbuffer_split(&chunk->uncompressed_data, &temp->uncompressed_data, offset + ANCHOR_JUMP);
-
           void * p = chunk->uncompressed_data.ptr + size;
           int p_n = chunk->uncompressed_data.n - size;
           mcb_t * p_mcb = chunk->uncompressed_data.mcb;
@@ -993,15 +747,12 @@ List * Fragment(void * targs){
             m2->check_flag=MBUFFER_CHECK_MAGIC;
           #endif
 
-          //if(r!=0) EXIT_TRACE("Unable to split memory buffer in fragmentation stage.\n");
           temp->header.state = CHUNK_STATE_UNCOMPRESSED;
           temp->sequence.l1num = anchorcount;
           anchorcount++;
 
           //put it into send buffer
-          //printf("Voor add \n");
           add(chunk, list);
-          //printf("Achter add\n");
           //prepare for next iteration
           chunk = temp;
           temp = NULL;
@@ -1020,149 +771,30 @@ List * Fragment(void * targs){
         chunk = NULL;
         split = 0;
       }
-      //printf("Aan het einde split loop\n");
     } while(split);
-    //printf("Aan het einde loop\n");
   }
-  //printf("Uit loop");
   free(rabintab);
   free(rabinwintab);
-  //printf("Uit fragment\n");
-
   return list;
 }
 #endif //ENABLE_PTHREADS
 
-/*
- * Pipeline stage function of reorder stage
- *
- * Actions performed:
- *  - Receive chunks from compression and deduplication stage
- *  - Check sequence number of each chunk to determine correct order
- *  - Cache chunks that arrive out-of-order until predecessors are available
- *  - Write chunks in-order to file (or preloading buffer)
- *
- * Notes:
- *  - This function blocks if the compression stage has not finished supplying
- *    the compressed data for a duplicate chunk.
- */
+//Write the compressed data to the output file.
 #ifdef ENABLE_PTHREADS
 void Write(Compressed_data ** data, int * counts) {
-
-
   int fd = 0;
-  //chunk_t *chunk;
   fd = create_output_file(conf->outfile);
-  /*
-  Iterator * iter = init_iterator(list);
-  int size = 0;
-  //int chunks = 0;
-  while(hasNext(iter)) {
-    //chunks++;
-    //write as many chunks as possible, current chunk is next in sequence
-    chunk = next(iter);
-    //printf("Chunk: %p\n",chunk);
-    //write_chunk_to_file(fd, chunk);
-    if(chunk->header.isDuplicate) size += (9 + SHA1_LEN);
-    else size += (9 + chunk->compressed_data.n);
-  }
-  //printf("Size = %d\n",size);
-  //printf("Chunks: %d\n",chunks);
-  //int chunks = 0;
-  //int duplicate = 0;
-  unsigned char * toWrite = (unsigned char *) malloc(size);
-  int index = 0;
-  //int type_fingerprint = TYPE_FINGERPRINT;
-  //int type_compress = TYPE_COMPRESS;
-  //u_long sha1_len = SHA1_LEN;
-  //printf("Grootte type: %d\n",sizeof(TYPE_FINGERPRINT));
-  //printf("Grootte int: %d\n",sizeof(type_fingerprint));
-  reset(iter);
-  while(hasNext(iter)){
-    //chunks++;
-    chunk = next(iter);
-    if(chunk->header.isDuplicate){
-      //duplicate++;
-      //for(int i = 0; i<sizeof(TYPE_FINGERPRINT);i++) toWrite+index+i = 0;
-      toWrite[index] = 0;
-      index++;
-      //memcpy(toWrite + index, &sha1_len, 8);
-      *((u_long*) (&toWrite[index])) = SHA1_LEN;
-      index += 8;
-      memcpy(toWrite + index, &chunk->sha1, SHA1_LEN);
-      index += SHA1_LEN;
-    }
-    else {
-      toWrite[index] = 1;
-      index ++;
-      //memcpy(toWrite + index, &chunk->compressed_data.n, sizeof(size_t));
-      *((u_long*) (&toWrite[index])) = chunk->compressed_data.n;
-      index += 8;
-      memcpy(toWrite + index, chunk->compressed_data.ptr, chunk->compressed_data.n);
-      //if(chunk->compressed_data.n>100000) printf("Chunk van meer dan 100 kB\n");
-      index += chunk->compressed_data.n;
-      //mbuffer_free(&chunk->compressed_data);
-    }
-      mbuffer_free(&chunk->uncompressed_data);
-      free(chunk);
-    //mbuffer_destroy
-    //free(chunk);
-  }*/
-  //printf("Uiteindelijke waarde index: %d\n",index);
-  //printf("Chunks en duplicates volgens write: %d, %d\n",chunks,duplicate);
-  //printf("Chunks: %d\n",chunks);
-
-  //for (int i = 0; i < conf->nthreads; i++) printf("Counts[%d] = %d\n",i,counts[i]);
 
   for (int i = 0; i<conf->nthreads; i++){
     for (int j = 0; j < counts[i];j++){
-      //printf("Writing %d %d\n",i,j);
       xwrite(fd, data[i][j].data, data[i][j].size);
       free(data[i][j].data);
-      //free(&(data[i][j]);
     }
     free(data[i]);
   }
-  //destroy(list);
-  //destroy_iterator(iter);
   close(fd);
-  //return NULL;*/
 }
 #endif //ENABLE_PTHREADS
-
-
-
-//Allocate all mbuffers at once to reduce malloc calls from threads
-/*void assign_compression_buffers(int duplicates, int size, List ** lists){
-  char * mbuffers = (char *)malloc(duplicates * sizeof(mcb_t) + size);
-
-  int index = 0;
-  for (int i = 0; i < conf->nthreads; i++){
-    Iterator * iter = init_iterator(lists[i]);
-    while(hasNext(iter)){
-      chunk_t * c = next(iter);
-      if(!c->header.isDuplicate){
-        int buffer_size;
-        if (conf->compress_type == COMPRESS_NONE) buffer_size = c->uncompressed_data.n;
-        else buffer_size = c->uncompressed_data.n + (c->uncompressed_data.n >> 9) + 12;
-
-        //void * ptr = malloc(buffer_size);
-        char * ptr = &mbuffers[index] + sizeof(mcb_t);
-        mbuffer_t * m = &c->compressed_data;
-        m->mcb = (mcb_t*) (&mbuffers[index]);
-        m->ptr = ptr;
-        m->n = buffer_size;
-        m->mcb->i = 1;
-        m->mcb->ptr = ptr;
-        #ifdef ENABLE_MBUFFER_CHECK
-          m->check_flag=MBUFFER_CHECK_MAGIC;
-        #endif
-        index += sizeof(mcb_t) + buffer_size;
-      }
-    }
-    destroy_iterator(iter);
-  }
-}*/
 
 /*--------------------------------------------------------------------------*/
 /* Encode
@@ -1173,6 +805,7 @@ void Write(Compressed_data ** data, int * counts) {
  *
  */
 void Encode(config_t * _conf) {
+  printf("**Dedup encoding with minimal virtualization overhead**\n");
   struct stat filestat;
   int32 fd;
 
@@ -1252,13 +885,6 @@ void Encode(config_t * _conf) {
 #endif //ENABLE_PTHREADS
   }
 
-  /* Variables for 3 thread pools and 2 pipeline stage threads.
-   * The first and the last stage are serial (mostly I/O).
-   */
-  /*pthread_t threads_anchor[MAX_THREADS],
-    threads_chunk[MAX_THREADS],
-    threads_compress[MAX_THREADS];*/
-
   data_process_args.tid = 0;
   data_process_args.fd = fd;
 
@@ -1266,168 +892,63 @@ void Encode(config_t * _conf) {
     __parsec_roi_begin();
 #endif
 
-
-  threadpool pool = thpool_init(14);
-
-  printf("Entering fragmentation stage\n");
-  //fflush(stdout);
   int threadCount = conf->nthreads;
+  threadpool pool = thpool_init(threadCount);
+
   List * fragmented = Fragment(&data_process_args);
   //clean up after preloading
     if(conf->preloading) free(preloading_buffer);
 
-  printf("Entering refinement stage\n");
+
   List ** refined = split(threadCount, fragmented);
-  //printf("Successfully split list\n");
   int i = 0;
-  struct thread_args anchor_thread_args[conf->nthreads];
-  stats_t threads_anchor_rv[conf->nthreads];
-  for (i = 0; i < conf->nthreads; i ++) {
+  struct thread_args anchor_thread_args[threadCount];
+  stats_t threads_anchor_rv[threadCount];
+  for (i = 0; i < threadCount; i ++) {
      anchor_thread_args[i].tid = i;
      anchor_thread_args[i].list = refined[i];
-     //printf("Length refined[i]: %d\n",refined[i]->length);
 
      anchor_thread_args[i].stats = &threads_anchor_rv[i];
      anchor_thread_args[i].list_addr = &(refined[i]);
 
      thpool_add_work(pool, FragmentRefine, &anchor_thread_args[i]);
-
-     //pthread_create(&threads_anchor[i], NULL, FragmentRefine, &anchor_thread_args[i]);
-     //FragmentRefine(&anchor_thread_args[i]);
   }
-  //
-
   thpool_wait(pool);
 
-  /*for (i = 0; i < conf->nthreads; i ++)
-    pthread_join(threads_anchor[i], (void **)&threads_anchor_rv[i]);*/
-
-  printf("Entering deduplication stage\n");
-  //int qs = 0;
   List * refined_merged = emptylist();
-  //printf("Voor merge\n");
-  /*while (qs < threadCount){
-    //printf("Voor merge. Lengte refined[qs]: %d\n",refined[qs]->length);
-    //printf("Lengte refined: %d\n", refined[qs]->length);
-    refined_merged = merge(refined_merged,refined[qs]);
-    //printf("Na merge\n");
-    qs++;
-  }*/
   for (i = 0; i < threadCount; i++) refined_merged = merge(refined_merged,refined[i]);
-  //printf("Na merge\n");
-  /*Node * nnn = refined_merged->head;
-  for (int i = 1; i <= refined_merged->length; i++){
-    //if(nnn == NULL) printf("Node %d is NULL\n",i);
-    //else printf("%d",i);
-    nnn = nnn->next;
-  }*/
-  //printf("Voor split_mod. Totaal aantal chunks: %d\n",refined_merged->length);
   List ** dedup = split_mod(threadCount, refined_merged);
-  //printf("Na split_mod\n");
-  struct thread_args chunk_thread_args[conf->nthreads];
-  stats_t threads_chunk_rv[conf->nthreads];
-  for (i = 0; i < conf->nthreads; i ++) {
+
+  struct thread_args chunk_thread_args[threadCount];
+  stats_t threads_chunk_rv[threadCount];
+  for (i = 0; i < threadCount; i ++) {
     chunk_thread_args[i].tid = i;
     chunk_thread_args[i].list = dedup[i];
-    //printf("Assigning stats\n");
     chunk_thread_args[i].stats = &threads_chunk_rv[i];
-    //printf("Checking sequence to_dedup\n");
-    //check_sequence(to_dedup[i]);
-    //printf("Sequence to_dedup OK\n");
-    //printf("Creating dedup task\n");
     thpool_add_work(pool, Deduplicate, &chunk_thread_args[i]);
-    //printf("Created dedup task\n");
-    //pthread_create(&threads_chunk[i], NULL, Deduplicate, &chunk_thread_args[i]);
-
-    //Deduplicate(&chunk_thread_args[i]);
   }
-  //printf("Created dedup threads\n");
   thpool_wait(pool);
-  /*for (i = 0; i < conf->nthreads; i ++)
-    pthread_join(threads_chunk[i], (void **)&threads_chunk_rv[i]);*/
 
-    //return;
-
-  printf("Entering compression stage\n");
-
-  //Gather all useful stats by traversing the dedup lists once
-  /*int chunks = 0;
-  int duplicates = 0;
-  int uncompressed_data_size = 0;
-  for (i = 0; i < threadCount; i++){
-    chunks+=dedup[i]->length;
-    Iterator * iter = init_iterator(dedup[i]);
-    while(hasNext(iter)){
-      chunk_t * c = next(iter);
-      if(!c->header.isDuplicate) duplicates++;
-      uncompressed_data_size+=c->uncompressed_data.n;
-    }
-    destroy_iterator(iter);
-  }*/
-  //return;
-
-  //List ** test = malloc(threadCount * sizeof(List *));
-  //for (int i = 0; i<threadCount; i++) test[i] = dedup[i];
-  //assign_compression_buffers(duplicates, uncompressed_data_size, dedup);
-  //printf("Before zip_split\n");
   List ** compress = zip_split(threadCount, dedup);
-  //printf("After zip_split\n");
   Compressed_data * total_compressed_data[threadCount];
-
   int buffer_counts[threadCount];
 
-  //char ** write_buffers = malloc(sizeof(char *) * (list->length/100 + ((list->length % 100 == 0) ? 1:0)));
-
-  struct thread_args compress_thread_args[conf->nthreads];
-  stats_t threads_compress_rv[conf->nthreads];
-  for (i = 0; i < conf->nthreads; i ++) {
+  struct thread_args compress_thread_args[threadCount];
+  stats_t threads_compress_rv[threadCount];
+  for (i = 0; i < threadCount; i ++) {
     compress_thread_args[i].tid = i;
     compress_thread_args[i].list = compress[i];
-    int write_buffer_count = compress[i]->length/100 + ((compress[i]->length % 100 == 0) ? 0:1);
-    //printf("Lengte buffer: %d\n", write_buffer_count);
+    int write_buffer_count = compress[i]->length/1000 + ((compress[i]->length % 1000 == 0) ? 0:1);
     total_compressed_data[i] = malloc(write_buffer_count * sizeof(Compressed_data));
     buffer_counts[i] = write_buffer_count;
     compress_thread_args[i].compressed_data = total_compressed_data[i];
     compress_thread_args[i].stats = &threads_compress_rv[i];
-    //printf("Checking sequence compressed before compression\n");
-    //check_sequence(compressed[i]);
-    //printf("Sequence compressed before compression OK\n");
     thpool_add_work(pool, Compress, &compress_thread_args[i]);
-
-    //pthread_create(&threads_compress[i], NULL, Compress, &compress_thread_args[i]);
-    //Compress(&compress_thread_args[i]);
   }
   thpool_wait(pool);
   thpool_destroy(pool);
 
-  /*for (i = 0; i < conf->nthreads; i ++){
-    //printf("Joining thread\n");
-    pthread_join(threads_compress[i], (void **)&threads_compress_rv[i]);
-    //printf("Joined thread\n");
-  }*/
-
-
-  //while(1) printf("Voorbij join\n");
-  //return;
-  printf("Entering writing stage\n");
-  /*List ** dedupped_merged = malloc(threadCount * sizeof(List *));
-  for (i = 0; i < threadCount; i++){
-    //printf("Checking sequence compressed\n");
-    //check_sequence(compressed[i]);
-    //printf("Sequence compressed OK\n");
-    //printf("Checking sequence dedup_qs\n");
-    //check_sequence(dedup_qs[i]->send);
-    //printf("Sequence dedup_qs OK\n");
-     dedupped_merged[i] = sorted_merge(compressed[i], dedup_qs[i]->send);
-   }*/
-   //printf("Voorbij sorted_merge\n");
-
-  //printf("Voorbij zip\n");
-
-
-
   Write(total_compressed_data, buffer_counts);
-
 
 #ifdef ENABLE_PARSEC_HOOKS
   __parsec_roi_end();
@@ -1435,41 +956,13 @@ void Encode(config_t * _conf) {
 
 #ifdef ENABLE_STATISTICS
   //Merge everything into global `stats' structure
-  for(i=0; i<conf->nthreads; i++) {
-    merge_stats(&stats, &threads_anchor_rv[i]);
-    //free(threads_anchor_rv[i]);
-  }
-  for(i=0; i<conf->nthreads; i++) {
-    merge_stats(&stats, &threads_chunk_rv[i]);
-    //free(threads_chunk_rv[i]);
-  }
-  for(i=0; i<conf->nthreads; i++) {
-    merge_stats(&stats, &threads_compress_rv[i]);
-    //free(threads_compress_rv[i]);
-  }
+  for(i=0; i<conf->nthreads; i++) merge_stats(&stats, &threads_anchor_rv[i]);
+  for(i=0; i<conf->nthreads; i++) merge_stats(&stats, &threads_chunk_rv[i]);
+  for(i=0; i<conf->nthreads; i++) merge_stats(&stats, &threads_compress_rv[i]);
 #endif //ENABLE_STATISTICS
 
   // clean up with the src file
-  if (conf->infile != NULL)
-    close(fd);
-
-  //free(refined);
-
-  //free(refined_merged);
-
-  //Send queues are freed by merge function.
-  //for (int i = 0; i < threadCount; i++) free(dedup_qs[i]);
-  //free(dedup_qs);
-
-
-  //Sublists are freed by sorted_merge.
-  //free(compressed);
-
-  //free(dedupped_merged);
-
-  //destroy(to_reorder);
-
-
+  if (conf->infile != NULL) close(fd);
 
   hashtable_destroy(cache, FALSE);
 
@@ -1482,6 +975,5 @@ void Encode(config_t * _conf) {
   //Analyze and print statistics
   if(conf->verbose) print_stats(&stats);
 #endif //ENABLE_STATISTICS
-
 
 }
