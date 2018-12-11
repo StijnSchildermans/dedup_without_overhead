@@ -382,7 +382,9 @@ void Compress(void * targs) {
           memcpy(write_buffer + index, chunk->compressed_data.ptr, chunk->compressed_data.n);
           index += chunk->compressed_data.n;
         }
+        free(chunk);
       }
+      free(mbuffers);
       args->compressed_data[write_buffers_index].data = write_buffer;
       args->compressed_data[write_buffers_index].size = write_buffer_size;
       write_buffers_index++;
